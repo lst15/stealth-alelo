@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ class Config:
     authenticate_button_selector: str
     authenticate_button_text: str
     post_auth_validation_text: str
+    user_data_dir: str
+    background_headed: bool
     headless: bool
     sandbox: bool
     keep_browser_open: bool
@@ -100,12 +103,20 @@ def build_config(args: argparse.Namespace) -> Config:
         raise ValueError(f"Variaveis obrigatorias ausentes no .env: {', '.join(missing)}")
 
     headless_from_env = parse_bool(get_env(dotenv, "HEADLESS"), default=False)
+    background_headed = parse_bool(get_env(dotenv, "BACKGROUND_HEADED"), default=False)
+    if args.background_headed:
+        background_headed = True
+
     if args.headed:
         headless = False
     elif args.headless:
         headless = True
     else:
         headless = headless_from_env
+
+    # Background headed always uses non-headless browser.
+    if background_headed:
+        headless = False
 
     keep_open = parse_bool(get_env(dotenv, "KEEP_BROWSER_OPEN"), default=True)
     if args.no_keep_open:
@@ -154,7 +165,12 @@ def build_config(args: argparse.Namespace) -> Config:
             'button, input[type="button"], input[type="submit"], a',
         ),
         authenticate_button_text=get_env(dotenv, "AUTHENTICATE_BUTTON_TEXT", "AUTENTICAR"),
-        post_auth_validation_text=get_env(dotenv, "POST_AUTH_VALIDATION_TEXT", "").strip(),
+        post_auth_validation_text=(
+            get_env(dotenv, "STEP5_VALIDATION_TEXT")
+            or get_env(dotenv, "POST_AUTH_VALIDATION_TEXT", "")
+        ).strip(),
+        user_data_dir=get_env(dotenv, "USER_DATA_DIR", str(Path(".browser-profile").resolve())),
+        background_headed=background_headed,
         headless=headless,
         sandbox=parse_bool(get_env(dotenv, "BROWSER_SANDBOX"), default=False),
         keep_browser_open=keep_open,
@@ -234,7 +250,7 @@ async def wait_for_text(stealth_server, instance_id: str, expected_text: str, ti
             return content
 
         if time.monotonic() - start >= timeout_seconds:
-            raise TimeoutError(f"Timeout aguardando texto '{expected_text}'. URL atual: {content.get('url')}")
+            raise TimeoutError(f"Timeout aguardando texto '{expected_text}'.")
 
         await asyncio.sleep(poll_interval)
 
@@ -249,7 +265,7 @@ async def wait_for_redirect(stealth_server, instance_id: str, initial_url: str, 
         text = content.get("text") or ""
 
         if current_url != last_url:
-            log("REDIRECT", f"URL mudou: {last_url} -> {current_url}")
+            log("REDIRECT", "Mudanca de URL detectada durante redirect")
             last_url = current_url
 
         redirected = current_url != initial_url
@@ -261,7 +277,6 @@ async def wait_for_redirect(stealth_server, instance_id: str, initial_url: str, 
         if time.monotonic() - start >= timeout_seconds:
             raise TimeoutError(
                 "Timeout aguardando redirect. "
-                f"URL inicial: {initial_url} | URL atual: {current_url} | "
                 f"Texto esperado no redirect: '{expected_text or '(nao definido)'}'"
             )
 
@@ -276,22 +291,25 @@ async def run_flow(config: Config) -> None:
 
     log("INIT", f"Stealth Browser MCP: {config.stealth_path}")
     log("INIT", f"Modo: {'headless' if config.headless else 'headed'}")
+    log("INIT", f"Background headed (Xvfb): {config.background_headed}")
     log("INIT", f"Sandbox: {config.sandbox}")
+    log("INIT", f"User data dir: {config.user_data_dir}")
 
     instance = await call_tool(
         stealth_server,
         "spawn_browser",
         headless=config.headless,
         sandbox=config.sandbox,
+        user_data_dir=config.user_data_dir,
     )
     instance_id = instance["instance_id"]
     log("BROWSER", f"Instancia criada: {instance_id}")
 
     try:
-        log("STEP-1", f"Navegando para URL de login: {config.login_url}")
+        log("STEP-1", "Navegando para URL de login configurada")
         nav = await call_tool(stealth_server, "navigate", instance_id=instance_id, url=config.login_url)
         initial_url = nav.get("url") or config.login_url
-        log("STEP-1", f"URL apos primeira navegacao: {initial_url}")
+        log("STEP-1", "Navegacao inicial concluida")
 
         log("STEP-1", "Aguardando redirect e validacao de texto da pagina...")
         redirect_content = await wait_for_redirect(
@@ -302,8 +320,7 @@ async def run_flow(config: Config) -> None:
             timeout_seconds=config.redirect_timeout_seconds,
             poll_interval=config.poll_interval_seconds,
         )
-        redirected_url = redirect_content.get("url") or ""
-        log("STEP-1", f"Redirect confirmado para: {redirected_url}")
+        log("STEP-1", "Redirect confirmado")
 
         if config.redirect_validation_text:
             log("STEP-1", f"Texto de validacao encontrado no redirect: '{config.redirect_validation_text}'")
@@ -346,6 +363,9 @@ async def run_flow(config: Config) -> None:
             text_match=config.entrar_text,
         )
 
+        log("STEP-3", "Aguardando 5 segundos antes da screenshot pos-click")
+        await asyncio.sleep(5)
+
         post_click_shot = artifacts_dir / f"02_after_entrar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         log("STEP-3", f"Salvando screenshot apos click: {post_click_shot}")
         await call_tool(
@@ -364,7 +384,7 @@ async def run_flow(config: Config) -> None:
                 timeout_seconds=config.post_login_timeout_seconds,
                 poll_interval=config.poll_interval_seconds,
             )
-            log("STEP-3", f"Validacao pos-login OK. URL atual: {post_login_content.get('url')}")
+            log("STEP-3", "Validacao pos-login OK")
 
         if config.receive_code_text:
             log("STEP-4", f"Clicando no botao: '{config.receive_code_text}'")
@@ -394,55 +414,56 @@ async def run_flow(config: Config) -> None:
                     timeout_seconds=config.receive_code_timeout_seconds,
                     poll_interval=config.poll_interval_seconds,
                 )
-                log("STEP-4", f"Validacao apos receber codigo OK. URL atual: {receive_code_content.get('url')}")
+                log("STEP-4", "Validacao apos receber codigo OK")
+                log("STEP-5", f"Informe o OTP no console. Campo alvo: {config.otp_input_selector}")
+                otp_code = await asyncio.to_thread(input, "Digite o codigo OTP recebido por e-mail: ")
+                otp_code = otp_code.strip()
+                if not otp_code:
+                    raise ValueError("Codigo OTP vazio. Encerrando fluxo.")
 
-                if config.headless:
-                    otp_code = await asyncio.to_thread(input, "Digite o codigo recebido por e-mail: ")
-                    otp_code = otp_code.strip()
-                    if not otp_code:
-                        raise ValueError("Codigo OTP vazio. Encerrando fluxo.")
+                log("STEP-5", "Preenchendo codigo recebido no campo OTP")
+                await call_tool(
+                    stealth_server,
+                    "type_text",
+                    instance_id=instance_id,
+                    selector=config.otp_input_selector,
+                    text=otp_code,
+                    clear_first=True,
+                )
 
-                    log("STEP-5", "Preenchendo codigo recebido no campo OTP")
-                    await call_tool(
-                        stealth_server,
-                        "type_text",
+                log("STEP-5", f"Clicando no botao: '{config.authenticate_button_text}'")
+                await call_tool(
+                    stealth_server,
+                    "click_element",
+                    instance_id=instance_id,
+                    selector=config.authenticate_button_selector,
+                    text_match=config.authenticate_button_text,
+                )
+
+                log("STEP-5", "Aguardando 5 segundos antes da screenshot pos-autenticacao")
+                await asyncio.sleep(5)
+
+                step5_shot = artifacts_dir / f"04_after_authenticate_click_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                log("STEP-5", f"Salvando screenshot apos click em autenticar: {step5_shot}")
+                await call_tool(
+                    stealth_server,
+                    "take_screenshot",
+                    instance_id=instance_id,
+                    file_path=str(step5_shot.resolve()),
+                )
+
+                if config.post_auth_validation_text:
+                    log("STEP-5", f"Aguardando texto de validacao pos-autenticacao: '{config.post_auth_validation_text}'")
+                    post_auth_content = await wait_for_text(
+                        stealth_server=stealth_server,
                         instance_id=instance_id,
-                        selector=config.otp_input_selector,
-                        text=otp_code,
-                        clear_first=True,
+                        expected_text=config.post_auth_validation_text,
+                        timeout_seconds=config.post_auth_timeout_seconds,
+                        poll_interval=config.poll_interval_seconds,
                     )
-
-                    log("STEP-5", f"Clicando no botao: '{config.authenticate_button_text}'")
-                    await call_tool(
-                        stealth_server,
-                        "click_element",
-                        instance_id=instance_id,
-                        selector=config.authenticate_button_selector,
-                        text_match=config.authenticate_button_text,
-                    )
-
-                    step5_shot = artifacts_dir / f"04_after_authenticate_click_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                    log("STEP-5", f"Salvando screenshot apos click em autenticar: {step5_shot}")
-                    await call_tool(
-                        stealth_server,
-                        "take_screenshot",
-                        instance_id=instance_id,
-                        file_path=str(step5_shot.resolve()),
-                    )
-
-                    if config.post_auth_validation_text:
-                        log("STEP-5", f"Aguardando texto de validacao pos-autenticacao: '{config.post_auth_validation_text}'")
-                        post_auth_content = await wait_for_text(
-                            stealth_server=stealth_server,
-                            instance_id=instance_id,
-                            expected_text=config.post_auth_validation_text,
-                            timeout_seconds=config.post_auth_timeout_seconds,
-                            poll_interval=config.poll_interval_seconds,
-                        )
-                        log("STEP-5", f"Validacao pos-autenticacao OK. URL atual: {post_auth_content.get('url')}")
+                    log("STEP-5", "Validacao pos-autenticacao OK")
 
         log("DONE", "Fluxo concluido com sucesso.")
-        log("DONE", f"URL atual apos login: {(await get_page_content_safe(stealth_server, instance_id)).get('url')}")
         log("DONE", f"Screenshots salvos em: {artifacts_dir.resolve()}")
 
         if config.keep_browser_open:
@@ -459,13 +480,36 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--headless", action="store_true", help="Forca modo headless")
     mode.add_argument("--headed", action="store_true", help="Forca modo headed")
+    parser.add_argument("--background-headed", action="store_true", help="Executa headed em background via Xvfb (anti-captcha melhor que headless)")
     parser.add_argument("--no-keep-open", action="store_true", help="Nao manter o navegador aberto ao final")
     return parser.parse_args()
+
+
+def ensure_xvfb_background(args: argparse.Namespace, config: Config) -> None:
+    if not config.background_headed:
+        return
+
+    if os.environ.get("STEALTH_XVFB_ACTIVE") == "1":
+        return
+
+    if not shutil.which("xvfb-run"):
+        raise RuntimeError(
+            "BACKGROUND_HEADED/--background-headed requer xvfb-run instalado. "
+            "Instale com: sudo apt-get update && sudo apt-get install -y xvfb"
+        )
+
+    cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", sys.executable, Path(__file__).resolve().as_posix()]
+    cmd.extend(sys.argv[1:])
+    env = os.environ.copy()
+    env["STEALTH_XVFB_ACTIVE"] = "1"
+    log("INIT", "Relancando processo em Xvfb para rodar headed em background")
+    os.execvpe(cmd[0], cmd, env)
 
 
 def main() -> None:
     args = parse_args()
     config = build_config(args)
+    ensure_xvfb_background(args, config)
     asyncio.run(run_flow(config))
 
 
