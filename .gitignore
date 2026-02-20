@@ -1,5 +1,31 @@
+# Secrets and local envs
 .env
-__pycache__/
-*.pyc
-artifacts/*.png
+.env.*
+!.env.example
+env/*.env
+
+# Browser/session local state
+.browser-profile/
 .stealth-browser-mcp/
+
+# Runtime outputs
+artifacts/*
+!artifacts/.gitkeep
+element_clones/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Logs and temp
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
